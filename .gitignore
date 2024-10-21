@@ -2,3 +2,5 @@ __pycache__/
 data/
 checkpoints/
 runs/
+clustered_results/
+*.log
