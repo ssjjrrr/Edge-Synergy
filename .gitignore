@@ -4,3 +4,4 @@ checkpoints/
 runs/
 clustered_results/
 *.log
+*.zip
