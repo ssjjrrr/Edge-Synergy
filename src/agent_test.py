@@ -1,138 +1,83 @@
 import os
-import cv2
-import time
-import logging
-import torch
-import json
-import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import pandas as pd
 import gymnasium as gym
-from sklearn.cluster import MeanShift, estimate_bandwidth, KMeans
-from sklearn.metrics import silhouette_score
+import logging
+import numpy as np
+import cv2
 from pathlib import Path
-from gymnasium import spaces
+from functools import partial
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from scipy.spatial.distance import cdist
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.vec_env import DummyVecEnv
-from functools import partial
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.policies import BasePolicy
+import torch.nn as nn
+import torch
+from gymnasium import spaces
+import random
 
 def setup_logging():
-    """
-    Set up logging configuration.
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("processing.log", mode='w')
-        ]
-    )
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
 
-def load_yolo_detections(csv_path=None, json_path=None, npy_path=None, txt_path=None):
+def load_yolo_detections(txt_path):
     """
-    Load YOLO detection boxes from various file formats.
-
-    Args:
-        csv_path (str, optional): Path to CSV file.
-        json_path (str, optional): Path to JSON file.
-        npy_path (str, optional): Path to NumPy file.
-        txt_path (str, optional): Path to TXT file.
-
-    Returns:
-        np.ndarray: Array of detection boxes with shape (N, 4).
+    Load YOLO detection results from a text file.
     """
-    if csv_path:
-        df = pd.read_csv(csv_path)
-        # Assuming CSV contains 'x_center', 'y_center', 'width', 'height'
-        detections = df[['x_center', 'y_center', 'width', 'height']].values
-    elif json_path:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        detections = np.array([[item['x_center'], item['y_center'], item['width'], item['height']] for item in data])
-    elif npy_path:
-        detections = np.load(npy_path)
-    elif txt_path:
-        # Read TXT file, assuming format: class x y w h score
-        df = pd.read_csv(txt_path, sep=' ', header=None, names=['class', 'x_center', 'y_center', 'width', 'height', 'confidence'])
-        detections = df[['x_center', 'y_center', 'width', 'height']].values
-    else:
-        raise ValueError("Please provide at least one file path (csv_path, json_path, npy_path, or txt_path).")
-    return detections
+    detections = []
+    with open(txt_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split(' ')
+            if len(parts) >= 5:
+                cls, x, y, w, h = parts[:5]
+                detections.append([float(x), float(y), float(w), float(h)])
+    return np.array(detections)
 
-def perform_meanshift(detections, bandwidth=None, quantile=0.2, n_samples=500):
+def perform_meanshift(data, bandwidth=None, alpha=0.5):
     """
-    Perform initial clustering using MeanShift.
-
-    Args:
-        detections (np.ndarray): Detection boxes with shape (N, 4).
-        bandwidth (float, optional): Bandwidth parameter for MeanShift.
-        quantile (float, optional): Quantile parameter for bandwidth estimation.
-        n_samples (int, optional): Number of samples to use for bandwidth estimation.
-
-    Returns:
-        np.ndarray: Cluster labels for each detection box.
+    Perform MeanShift clustering on the data.
     """
-    # Use only the positions (first two columns) for clustering
-    positions = detections[:, :2]
+    from sklearn.cluster import MeanShift, estimate_bandwidth
+
+    # Nonlinear transformation on y-coordinate
+    data_transformed = data.copy()
+    data_transformed[:, 1] = data_transformed[:, 1] ** alpha
 
     if bandwidth is None:
-        bandwidth = estimate_bandwidth(positions, quantile=quantile, n_samples=min(n_samples, len(positions)))
+        bandwidth = estimate_bandwidth(data_transformed[:, :2], quantile=0.2)
     ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-    ms.fit(positions)
+    ms.fit(data_transformed[:, :2])
     labels = ms.labels_
     return labels
 
 class RLClusteringEnv(gym.Env):
     """
-    Custom clustering environment for RL agent to adjust clusters by merging or splitting.
+    Custom RL environment for clustering adjustment.
     """
+    metadata = {'render.modes': ['human', 'rgb_array']}
 
-    def __init__(self, detections, initial_labels, num_clusters_min=3, num_clusters_max=10,
-                 alpha=1.0, beta=1.0, gamma=1.0, max_steps_per_episode=50):
-        """
-        Initialize the environment.
-
-        Args:
-            detections (np.ndarray): Detection boxes with shape (N, 4).
-            initial_labels (np.ndarray): Initial cluster labels with shape (N,).
-            num_clusters_min (int): Minimum number of clusters.
-            num_clusters_max (int): Maximum number of clusters.
-            alpha (float): Weight for tightness reward.
-            beta (float): Weight for cluster count penalty.
-            gamma (float): Weight for size variance penalty.
-            max_steps_per_episode (int): Maximum steps per episode.
-        """
+    def __init__(self, image, detections, initial_labels,
+                 num_clusters_min=3, num_clusters_max=10,
+                 alpha=1.0, beta=1.0, gamma=1.0,
+                 max_steps_per_episode=50):
         super(RLClusteringEnv, self).__init__()
-        self.detections = detections
-        self.num_boxes = detections.shape[0]
+        self.image = image
+        self.detections = detections  # Normalized detections [x_center, y_center, w, h]
+        self.initial_labels = initial_labels
         self.num_clusters_min = num_clusters_min
         self.num_clusters_max = num_clusters_max
-        self.alpha = alpha
-        self.beta = beta
-        self.gamma = gamma
+        self.alpha = alpha  # Tightness weight
+        self.beta = beta    # Cluster count penalty weight
+        self.gamma = gamma  # Size variance penalty weight
         self.max_steps_per_episode = max_steps_per_episode
+
+        # Initialize clusters
+        self.current_clusters = self._initial_clusters()
         self.current_step = 0
 
-        # Initial clustering
-        self.initial_labels = initial_labels
-        self.current_clusters = self._initial_clusters()
-
-        # Define maximum possible values for normalization
-        self.max_centroid_x = 1.0  # Assuming normalized positions in [0,1]
-        self.max_centroid_y = 1.0
-        self.max_area = np.sum(self.detections[:, 2] * self.detections[:, 3])  # Sum of all box areas
-        self.max_size = self.num_boxes  # Max number of boxes in a cluster
-        self.max_size_variance = 1.0  # Assumed maximum variance
-
-        # Define action space
-        self.action_space = self._define_action_space()
-
-        # Define observation space
+        # Define observation and action spaces
         self.observation_space = spaces.Box(
             low=0,
             high=1,
@@ -140,160 +85,195 @@ class RLClusteringEnv(gym.Env):
             dtype=np.float32
         )
 
-    def _initial_clusters(self):
-        """
-        Build initial clusters based on initial labels.
+        # Initialize action space placeholders
+        self.max_merge_actions = self.num_clusters_max  # Maximum possible merge actions
+        self.max_split_actions = self.num_clusters_max  # Maximum possible split actions
+        self.action_space = spaces.Discrete(1 + self.max_merge_actions + self.max_split_actions)
 
-        Returns:
-            list: List of clusters, each containing indices of detection boxes.
-        """
+        # Initialize action lists
+        self.merge_actions = []
+        self.split_actions = []
+
+    def _initial_clusters(self):
         clusters = []
-        unique_labels = np.unique(self.initial_labels)
-        for label in unique_labels:
-            cluster = np.where(self.initial_labels == label)[0].tolist()
-            clusters.append(cluster)
-        # If initial number of clusters exceeds max_clusters, keep only the first num_clusters_max clusters
-        if len(clusters) > self.num_clusters_max:
-            clusters = clusters[:self.num_clusters_max]
+        num_clusters = np.max(self.initial_labels) + 1
+        for i in range(num_clusters):
+            indices = np.where(self.initial_labels == i)[0].tolist()
+            clusters.append(indices)
         return clusters
 
     def _define_action_space(self):
         """
-        Define the action space, including keep, merge, and split actions.
-
-        Returns:
-            spaces.Discrete: The action space.
-        """
-        # Calculate possible merge actions
-        num_current_clusters = len(self.current_clusters)
-        merge_actions = int(num_current_clusters * (num_current_clusters - 1) / 2)
-        split_actions = num_current_clusters  # One split action per cluster
-
-        total_actions = 1 + merge_actions + split_actions  # Keep + Merge + Split
-        return spaces.Discrete(total_actions)
-
-    def _get_merge_action_indices(self, action):
-        """
-        Decode the action into specific clusters to merge or split.
-
-        Args:
-            action (int): The action index.
-
-        Returns:
-            tuple or int: Indices of clusters to merge or split.
+        Define the action space based on current clusters.
         """
         # Keep action
-        if action == 0:
-            return None
+        num_keep_actions = 1
 
+        # Merge actions: Only nearest neighbor pairs
+        nearest_pairs = self._get_nearest_neighbor_pairs()
+        self.merge_actions = nearest_pairs  # Store for use in step()
+        num_merge_actions = len(nearest_pairs)
+
+        # Split actions: One split action per cluster
         num_current_clusters = len(self.current_clusters)
-        merge_actions = int(num_current_clusters * (num_current_clusters - 1) / 2)
-        # Merge actions
-        if 1 <= action <= merge_actions:
-            idx = action - 1
-            for i in range(num_current_clusters):
-                for j in range(i + 1, num_current_clusters):
-                    if idx == 0:
-                        return (i, j)
-                    idx -= 1
-        # Split actions
-        split_action_start = 1 + merge_actions
-        split_idx = action - split_action_start
-        if 0 <= split_idx < num_current_clusters:
-            return split_idx
+        self.split_actions = [idx for idx in range(num_current_clusters) if len(self.current_clusters[idx]) > 1]
+        num_split_actions = len(self.split_actions)
 
-        return None
+        # Total actions
+        total_actions = num_keep_actions + num_merge_actions + num_split_actions
+
+        # Define fixed-size action space
+        total_actions_fixed = 1 + self.max_merge_actions + self.max_split_actions
+        self.action_space = spaces.Discrete(total_actions_fixed)
+
+    def _get_nearest_neighbor_pairs(self):
+        """
+        Find the nearest neighbor pairs among clusters.
+        Returns:
+            List of tuples: Each tuple contains indices of clusters to be merged (c1, c2).
+        """
+        # Get centroids of clusters
+        centroids = []
+        valid_cluster_indices = []
+        for idx, cluster in enumerate(self.current_clusters):
+            if len(cluster) > 0:
+                cluster_boxes = self.detections[cluster]
+                centroid = np.mean(cluster_boxes[:, :2], axis=0)
+                centroids.append(centroid)
+                valid_cluster_indices.append(idx)
+        centroids = np.array(centroids)
+
+        if len(centroids) < 2:
+            return []
+
+        # Compute distance matrix between centroids
+        distances = cdist(centroids, centroids, metric='euclidean')
+
+        # Set self-distance to infinity
+        np.fill_diagonal(distances, np.inf)
+
+        # Find nearest neighbor for each cluster
+        nearest_pairs = []
+        for i in range(len(centroids)):
+            j = np.argmin(distances[i])
+            c1 = valid_cluster_indices[i]
+            c2 = valid_cluster_indices[j]
+            # Ensure each pair is added only once
+            pair = tuple(sorted((c1, c2)))
+            if pair not in nearest_pairs:
+                nearest_pairs.append(pair)
+                # Set distances to infinity to avoid duplicate pairs
+                distances[i, j] = distances[j, i] = np.inf
+        return nearest_pairs
 
     def _get_state(self):
         """
         Get the current state representation.
-
-        Returns:
-            np.ndarray: State vector with normalized features.
         """
-        state = []
+        # Prepare the observation vector
+        state = np.zeros((self.num_clusters_max * 5,), dtype=np.float32)
+        for idx, cluster in enumerate(self.current_clusters):
+            if idx >= self.num_clusters_max:
+                break
+            if len(cluster) == 0:
+                continue
+            cluster_boxes = self.detections[cluster]
+            # Features: [mean_x, mean_y, mean_w, mean_h, cluster_size]
+            mean_vals = np.mean(cluster_boxes, axis=0)
+            cluster_size = len(cluster_boxes) / len(self.detections)
+            state[idx * 5: (idx + 1) * 5] = np.concatenate([mean_vals, [cluster_size]])
+        return state
+
+    def _compute_reward(self):
+        """
+        Compute the reward based on the current cluster configuration.
+        """
+        tightness = 0
+        variance = 0
+        num_valid_clusters = 0
+
         for cluster in self.current_clusters:
             if len(cluster) == 0:
-                # Pad empty clusters
-                state.extend([0, 0, 0, 0, 0])
                 continue
-            # Compute cluster features
+            num_valid_clusters += 1
             cluster_boxes = self.detections[cluster]
-            centroid = np.mean(cluster_boxes[:, :2], axis=0)  # x_center, y_center
-            area = np.sum(cluster_boxes[:, 2] * cluster_boxes[:, 3])  # Total area
-            size = len(cluster)
-            # Compute size variance within the cluster
-            var_w = np.var(cluster_boxes[:, 2])
-            var_h = np.var(cluster_boxes[:, 3])
-            size_variance = (var_w + var_h) / 2
+            # Compute tightness (mean distance to centroid)
+            centroid = np.mean(cluster_boxes[:, :2], axis=0)
+            distances = np.linalg.norm(cluster_boxes[:, :2] - centroid, axis=1)
+            tightness -= np.mean(distances)
+            # Compute size variance
+            sizes = cluster_boxes[:, 2] * cluster_boxes[:, 3]
+            variance += np.var(sizes)
 
-            # Normalize features
-            centroid_x_norm = np.clip(centroid[0] / self.max_centroid_x, 0.0, 1.0)
-            centroid_y_norm = np.clip(centroid[1] / self.max_centroid_y, 0.0, 1.0)
-            area_norm = np.clip(area / self.max_area, 0.0, 1.0)
-            size_norm = np.clip(size / self.max_size, 0.0, 1.0)
-            size_variance_norm = np.clip(size_variance / self.max_size_variance, 0.0, 1.0)
+        # Reward computation
+        reward = self.alpha * tightness - self.gamma * variance
 
-            state.extend([centroid_x_norm, centroid_y_norm, area_norm, size_norm, size_variance_norm])
+        # Cluster count penalty
+        num_clusters = num_valid_clusters
+        if num_clusters < self.num_clusters_min:
+            reward -= self.beta * (self.num_clusters_min - num_clusters)
+        elif num_clusters > self.num_clusters_max:
+            reward -= self.beta * (num_clusters - self.num_clusters_max)
+        return reward
 
-        # Pad remaining clusters
-        while len(state) < self.num_clusters_max * 5:
-            state.extend([0, 0, 0, 0, 0])
-
-        return np.array(state, dtype=np.float32)
+    def reset(self, seed=None):
+        """
+        Reset the environment.
+        """
+        super().reset(seed=seed)
+        self.current_clusters = self._initial_clusters()
+        self.current_step = 0
+        self._define_action_space()
+        return self._get_state(), {}
 
     def step(self, action):
         """
         Execute an action.
-
         Args:
-            action (int): The action index.
-
+            action (int): Action index.
         Returns:
-            Tuple[np.ndarray, float, bool, bool, dict]: observation, reward, terminated, truncated, info
+            observation, reward, terminated, truncated, info
         """
-        action_indices = self._get_merge_action_indices(action)
-        if action_indices is None:
+        self.current_step += 1
+
+        # Update action lists
+        self._define_action_space()
+
+        num_keep_actions = 1
+        num_merge_actions = len(self.merge_actions)
+        num_split_actions = len(self.split_actions)
+        total_actions = num_keep_actions + num_merge_actions + num_split_actions
+        total_actions_fixed = self.action_space.n
+
+        if action == 0:
             # Keep action
             pass
-        elif isinstance(action_indices, tuple) and len(action_indices) == 2:
-            # Merge action
-            c1, c2 = action_indices
-            if c1 < len(self.current_clusters) and c2 < len(self.current_clusters):
-                # Merge c2 into c1
-                self.current_clusters[c1].extend(self.current_clusters[c2])
-                self.current_clusters[c2] = []
-        elif isinstance(action_indices, int):
-            # Split action
-            c = action_indices
-            if c < len(self.current_clusters) and len(self.current_clusters[c]) > 1:
-                # Use KMeans to split into two sub-clusters
-                cluster = self.current_clusters[c]
-                cluster_boxes = self.detections[cluster]
-                try:
-                    kmeans = KMeans(n_clusters=2, random_state=0).fit(cluster_boxes)
-                    labels = kmeans.labels_
-                    cluster1 = [cluster[i] for i in range(len(cluster)) if labels[i] == 0]
-                    cluster2 = [cluster[i] for i in range(len(cluster)) if labels[i] == 1]
-                    self.current_clusters.append(cluster2)
-                    self.current_clusters[c] = cluster1
-                except Exception as e:
-                    logging.error(f"KMeans split failed: {e}")
-                    # Keep the original cluster if KMeans fails
-                    pass
+        elif 1 <= action <= self.max_merge_actions:
+            merge_idx = action - 1
+            if merge_idx < num_merge_actions:
+                c1, c2 = self.merge_actions[merge_idx]
+                self._merge_clusters(c1, c2)
+            else:
+                # Invalid merge action, optionally penalize
+                pass
+        elif (1 + self.max_merge_actions) <= action < total_actions_fixed:
+            split_idx = action - (1 + self.max_merge_actions)
+            if split_idx < num_split_actions:
+                c = self.split_actions[split_idx]
+                self._split_cluster(c)
+            else:
+                # Invalid split action, optionally penalize
+                pass
+        else:
+            # Invalid action, optionally penalize
+            pass
 
         # Compute reward
         reward = self._compute_reward()
 
-        # Update step count
-        self.current_step += 1
-
-        # Determine if the episode is terminated
-        if self.current_step >= self.max_steps_per_episode:
-            terminated = True
-        else:
-            terminated = False
-        truncated = False  # No truncation in this environment
+        # Check termination condition
+        terminated = self.current_step >= self.max_steps_per_episode
+        truncated = False  # Not using truncated in this context
 
         # Get observation
         observation = self._get_state()
@@ -301,143 +281,138 @@ class RLClusteringEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def _compute_reward(self):
-        """
-        Compute the reward based on current cluster configuration.
+    def _merge_clusters(self, c1, c2):
+        if c1 < len(self.current_clusters) and c2 < len(self.current_clusters):
+            # Merge c2 into c1
+            self.current_clusters[c1].extend(self.current_clusters[c2])
+            self.current_clusters[c2] = []
+        else:
+            # Handle invalid indices
+            pass
 
-        Returns:
-            float: The reward value.
+    def _split_cluster(self, c):
+        if c < len(self.current_clusters) and len(self.current_clusters[c]) > 1:
+            # Use KMeans to split the cluster into two sub-clusters
+            cluster = self.current_clusters[c]
+            cluster_boxes = self.detections[cluster]
+            try:
+                # Explicitly set n_init to suppress the warning
+                kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(cluster_boxes)
+                labels = kmeans.labels_
+                cluster1 = [cluster[i] for i in range(len(cluster)) if labels[i] == 0]
+                cluster2 = [cluster[i] for i in range(len(cluster)) if labels[i] == 1]
+                self.current_clusters[c] = cluster1
+                self.current_clusters.append(cluster2)
+            except Exception as e:
+                logging.error(f"KMeans split failed: {e}")
+        else:
+            # Cannot split clusters with only one element
+            pass
+
+
+    def render(self, mode='save_image'):
         """
-        tightness = 0
-        variance = 0
-        for cluster in self.current_clusters:
+        Render the current cluster configuration.
+        """
+        render_dir = "agent_render"
+        os.makedirs(render_dir, exist_ok=True)
+
+        vis_image = self.image.copy()
+        image_height, image_width = vis_image.shape[:2]
+
+        num_clusters = len(self.current_clusters)
+        colors = []
+        np.random.seed(42)
+        for _ in range(num_clusters):
+            color = [int(c) for c in np.random.randint(0, 255, 3)]
+            colors.append(color)
+
+        for cluster_idx, cluster in enumerate(self.current_clusters):
             if len(cluster) == 0:
                 continue
-            cluster_boxes = self.detections[cluster]
-            # Compute the large bounding box
-            x_min = np.min(cluster_boxes[:, 0] - cluster_boxes[:, 2] / 2)
-            y_min = np.min(cluster_boxes[:, 1] - cluster_boxes[:, 3] / 2)
-            x_max = np.max(cluster_boxes[:, 0] + cluster_boxes[:, 2] / 2)
-            y_max = np.max(cluster_boxes[:, 1] + cluster_boxes[:, 3] / 2)
-            large_w = x_max - x_min
-            large_h = y_max - y_min
-            large_area = large_w * large_h
-            small_area = np.sum(cluster_boxes[:, 2] * cluster_boxes[:, 3])
-            if large_area > 0:
-                ratio = small_area / large_area
-                tightness += ratio
-            # Compute size variance
-            var_w = np.var(cluster_boxes[:, 2])
-            var_h = np.var(cluster_boxes[:, 3])
-            variance += (var_w + var_h) / 2
-        # Reward computation
-        reward = self.alpha * tightness
-        # Cluster count penalty
-        num_clusters = len([c for c in self.current_clusters if len(c) > 0])
-        if num_clusters < self.num_clusters_min:
-            reward -= self.beta * (self.num_clusters_min - num_clusters)
-        elif num_clusters > self.num_clusters_max:
-            reward -= self.beta * (num_clusters - self.num_clusters_max)
-        # Size variance penalty
-        reward -= self.gamma * variance
-        return reward
+            color = colors[cluster_idx % len(colors)]
+            for idx in cluster:
+                box = self.detections[idx]
+                center_x, center_y, w, h = box
 
-    def reset(self, *, seed=None, options=None):
-        """
-        Reset the environment.
+                x1 = int((center_x - w / 2) * image_width)
+                y1 = int((center_y - h / 2) * image_height)
+                x2 = int((center_x + w / 2) * image_width)
+                y2 = int((center_y + h / 2) * image_height)
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(vis_image, f'C{cluster_idx}', (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        Args:
-            seed (int, optional): Random seed.
-            options (dict, optional): Additional options.
+        if mode == 'save_image':
+            save_path = os.path.join(render_dir, f"render_step_{self.current_step}.png")
+            cv2.imwrite(save_path, vis_image)
+            logging.info(f"Saved render image as {save_path}")
+        elif mode == 'rgb_array':
+            return vis_image
 
-        Returns:
-            Tuple[np.ndarray, dict]: Initial observation and info.
-        """
-        super().reset(seed=seed)
-        self.current_clusters = self._initial_clusters()
-        self.current_step = 0
-        return self._get_state(), {}
+class RenderCallback(BaseCallback):
+    def __init__(self, render_freq=100, verbose=0):
+        super(RenderCallback, self).__init__(verbose)
+        self.render_freq = render_freq
 
-    def render(self, mode='human'):
-        """
-        Render the current cluster configuration (optional).
-        """
-        pass  # Implement visualization if needed
+    def _on_step(self):
+        if self.n_calls % self.render_freq == 0:
+            env = self.model.get_env().envs[0]
+            env.render()
+        return True
 
-# def train_agent(env, model, total_timesteps=10000):
-#     """
-#     Train the RL agent using Stable Baselines3 PPO algorithm.
-
-#     Args:
-#         env (gym.Env): The clustering environment.
-#         model (stable_baselines3.PPO): PPO model instance.
-#         total_timesteps (int): Total training timesteps.
-#     """
-#     model.learn(total_timesteps=total_timesteps)
-#     model.save("ppo_rl_clustering")
-#     logging.info("RL agent trained and saved as ppo_rl_clustering.zip")
-
-# def test_agent(env, model):
-#     """
-#     Test the trained RL agent to adjust clusters.
-
-#     Args:
-#         env (gym.Env): The clustering environment.
-#         model (stable_baselines3.PPO): Trained PPO model.
-
-#     Returns:
-#         list: Final clustering result.
-#     """
-#     obs, info = env.reset()
-#     done = False
-#     while not done:
-#         action, _states = model.predict(obs, deterministic=True)
-#         obs, reward, done, truncated, info = env.step(action)
-#     # Get final clusters
-#     final_clusters = env.current_clusters
-#     num_final_clusters = len([c for c in final_clusters if len(c) > 0])
-#     logging.info(f"Final number of clusters after RL adjustment: {num_final_clusters}")
-#     return final_clusters
+def test_agent(env, model):
+    """
+    Test the trained RL agent to adjust clusters.
+    Args:
+        env (gym.Env): The clustering environment.
+        model (stable_baselines3.PPO): Trained PPO model.
+    Returns:
+        list: Final clustering result.
+    """
+    obs, info = env.reset()
+    done = False
+    while not done:
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, done, truncated, info = env.step(action)
+        env.render()
+    # Get final clusters
+    final_clusters = env.current_clusters
+    num_final_clusters = len([c for c in final_clusters if len(c) > 0])
+    logging.info(f"Final number of clusters after RL adjustment: {num_final_clusters}")
+    return final_clusters
 
 def process_image_with_rl(image_path, annotation_path, output_path, model, class_filter=0,
-                          bandwidth=None, num_clusters_min=3, num_clusters_max=10):
+                          bandwidth=None, num_clusters_min=8, num_clusters_max=15):
     """
     Process a single image and its annotation, perform clustering, and save the result image.
     Uses MeanShift for initial clustering and then adjusts clusters using the trained RL agent.
-
-    Args:
-        image_path (Path): Path to the image file.
-        annotation_path (Path): Path to the annotation file.
-        output_path (Path): Path to save the result image.
-        model (stable_baselines3.PPO): Trained RL model.
-        class_filter (int, optional): Target class to filter. Defaults to 0.
-        bandwidth (float, optional): Bandwidth parameter for MeanShift. Defaults to 0.1.
-        num_clusters_min (int, optional): Minimum number of clusters. Defaults to 3.
-        num_clusters_max (int, optional): Maximum number of clusters. Defaults to 10.
     """
-    detections = []
-    try:
-        with open(annotation_path, 'r') as f:
-            for line in f:
-                parts = line.strip().split(' ')
-                if len(parts) == 6:
-                    cls, x, y, w, h, conf = parts
-                    detections.append({
-                        'class': int(cls),
-                        'x': float(x),
-                        'y': float(y),
-                        'w': float(w),
-                        'h': float(h),
-                        'confidence': float(conf)
-                    })
-    except Exception as e:
-        logging.error(f"Failed to read annotation file {annotation_path}: {e}")
+    image = cv2.imread(str(image_path))
+    if image is None:
+        logging.error(f"Cannot read image {image_path}")
         return
+    height, width = image.shape[:2]
+
+    # Read annotations
+    detections = []
+    with open(annotation_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split(' ')
+            if len(parts) >= 5:
+                cls, x, y, w, h = parts[:5]
+                detections.append({
+                    'class': int(cls),
+                    'x': float(x),
+                    'y': float(y),
+                    'w': float(w),
+                    'h': float(h)
+                })
 
     # Filter detections by class
     class_detections = [det for det in detections if det['class'] == class_filter]
 
-    # Get positions and sizes
+    # Get positions and sizes (normalized)
     positions_sizes = []
     for det in class_detections:
         center_x = det['x']
@@ -447,12 +422,9 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         positions_sizes.append([center_x, center_y, w, h])
     positions_sizes = np.array(positions_sizes)
 
-    # Normalize positions and sizes to [0,1]
-    positions_sizes[:, :4] = positions_sizes[:, :4] / np.max(positions_sizes[:, :4], axis=0)
-
     # Perform MeanShift clustering
     if len(positions_sizes) > 0:
-        initial_labels = perform_meanshift(positions_sizes, bandwidth=bandwidth)
+        initial_labels = perform_meanshift(positions_sizes, bandwidth=bandwidth, alpha=0.5)
 
         # Compute Silhouette Score
         if len(np.unique(initial_labels)) > 1:
@@ -466,20 +438,22 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
 
     # Create RL environment
     env = RLClusteringEnv(
+        image=image,
         detections=positions_sizes,
         initial_labels=initial_labels,
         num_clusters_min=num_clusters_min,
         num_clusters_max=num_clusters_max,
         alpha=1.0,
         beta=1.0,
-        gamma=1.0
+        gamma=1.0,
+        max_steps_per_episode=50
     )
 
     # Use the trained RL model to adjust clusters
     final_clusters = test_agent(env, model)
 
     # Compute final cluster labels
-    final_labels = np.full(initial_labels.shape, -1)
+    final_labels = np.full(len(class_detections), -1)
     cluster_id = 0
     for cluster in final_clusters:
         if len(cluster) == 0:
@@ -487,13 +461,6 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         for idx in cluster:
             final_labels[idx] = cluster_id
         cluster_id += 1
-
-    # Load the image
-    image = cv2.imread(str(image_path))
-    if image is None:
-        logging.error(f"Cannot read image {image_path}")
-        return
-    height, width = image.shape[:2]
 
     # Convert normalized coordinates back to absolute values
     for det in class_detections:
@@ -546,8 +513,8 @@ def main_rl_training():
     """
     setup_logging()
     # Define directory paths
-    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/train')  # Replace with your image folder path
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/predict/labels')  # Replace with your annotation folder path
+    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')  # Replace with your image folder path
+    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -562,6 +529,7 @@ def main_rl_training():
 
     # Collect environment creation functions
     for image_path in image_files:
+        image = cv2.imread(str(image_path))
         annotation_filename = image_path.stem + '.txt'
         annotation_path = annotations_dir / annotation_filename
 
@@ -574,17 +542,19 @@ def main_rl_training():
         if detections.size == 0:
             logging.warning(f"Annotation file {annotation_path} has no valid detections, skipping {image_path.name}")
             continue
-        detections = detections / np.max(detections, axis=0)  # Normalize to [0,1]
+        # Do NOT normalize again
+        # detections = detections / np.max(detections, axis=0)  # Remove this line
 
         # Perform MeanShift clustering
-        initial_labels = perform_meanshift(detections, bandwidth=None)
+        initial_labels = perform_meanshift(detections, bandwidth=None, alpha=0.5)
 
         # Define an environment creation function
         env_fn = partial(RLClusteringEnv,
+                         image=image,
                          detections=detections,
                          initial_labels=initial_labels,
-                         num_clusters_min=3,
-                         num_clusters_max=10,
+                         num_clusters_min=8,
+                         num_clusters_max=15,
                          alpha=1.0,
                          beta=1.0,
                          gamma=1.0,
@@ -624,12 +594,12 @@ def main_rl_training():
     total_timesteps = steps_per_env * n_envs
 
     logging.info(f"Total training timesteps (all environments): {total_timesteps}")
-
+    render_callback = RenderCallback(render_freq=15)
     # Train the RL agent
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, callback=render_callback)
 
     # Save the model
-    model.save("ppo_rl_clustering")
+    model.save("checkpoints/ppo_rl_clustering")
     logging.info("RL agent trained and saved as ppo_rl_clustering.zip")
 
 def main():
@@ -639,8 +609,8 @@ def main():
     setup_logging()
     # Define directory paths
     images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')  # Replace with your image folder path
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/predict/labels')  # Replace with your annotation folder path
-    output_dir = Path('/home/edge/work/Edge-Synergy/clustered_results')  # Replace with your desired output folder path
+    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
+    output_dir = Path('/home/edge/work/Edge-Synergy/cluster_output')  # Replace with your desired output folder path
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -652,7 +622,7 @@ def main():
 
     # Load the trained RL model
     try:
-        model = PPO.load("ppo_rl_clustering")
+        model = PPO.load("checkpoints/ppo_rl_clustering")
         logging.info("Loaded trained RL agent model ppo_rl_clustering.zip")
     except Exception as e:
         logging.error(f"Failed to load model: {e}")
@@ -675,7 +645,7 @@ def main():
             model=model,
             class_filter=0,
             num_clusters_min=3,
-            num_clusters_max=10
+            num_clusters_max=15
         )
 
 if __name__ == "__main__":
