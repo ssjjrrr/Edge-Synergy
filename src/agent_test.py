@@ -375,7 +375,7 @@ def test_agent(env, model):
     while not done:
         action, _states = model.predict(obs, deterministic=True)
         obs, reward, done, truncated, info = env.step(action)
-        env.render()
+        # env.render()
     # Get final clusters
     final_clusters = env.current_clusters
     num_final_clusters = len([c for c in final_clusters if len(c) > 0])
@@ -513,8 +513,8 @@ def main_rl_training():
     """
     setup_logging()
     # Define directory paths
-    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')  # Replace with your image folder path
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
+    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')
+    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -649,7 +649,6 @@ def main():
         )
 
 if __name__ == "__main__":
-    # Choose training or application mode
     mode = input("Select mode: 1 - Train RL agent, 2 - Apply RL agent to adjust clusters (enter 1 or 2): ")
     if mode == '1':
         main_rl_training()

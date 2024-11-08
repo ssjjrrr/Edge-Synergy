@@ -1,8 +1,8 @@
 __pycache__/
-data/
-checkpoints/
+PANDA/
 runs/
 cluster_output/
 agent_render/
 *.log
 *.zip
+*.pt
