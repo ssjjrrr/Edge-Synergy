@@ -56,12 +56,12 @@ class RLClusteringEnv(gym.Env):
     """
     Custom RL environment for clustering adjustment.
     """
-    metadata = {'render.modes': ['human', 'rgb_array']}
+    metadata = {'render.modes': ['save_image', 'rgb_array']}
 
     def __init__(self, image, detections, initial_labels,
-                 num_clusters_min=3, num_clusters_max=10,
-                 alpha=1.0, beta=1.0, gamma=1.0,
-                 max_steps_per_episode=50):
+                 num_clusters_min=5, num_clusters_max=20,
+                 alpha=1.0, beta=5.0, gamma=1.0,
+                 max_steps_per_episode=100):
         super(RLClusteringEnv, self).__init__()
         self.image = image
         self.detections = detections  # Normalized detections [x_center, y_center, w, h]
@@ -81,7 +81,7 @@ class RLClusteringEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=0,
             high=1,
-            shape=(self.num_clusters_max * 5,),
+            shape=((self.num_clusters_max + 10) * 5,),
             dtype=np.float32
         )
 
@@ -171,9 +171,10 @@ class RLClusteringEnv(gym.Env):
         Get the current state representation.
         """
         # Prepare the observation vector
-        state = np.zeros((self.num_clusters_max * 5,), dtype=np.float32)
+        max_clusters = self.num_clusters_max + 10
+        state = np.zeros((max_clusters * 5,), dtype=np.float32)
         for idx, cluster in enumerate(self.current_clusters):
-            if idx >= self.num_clusters_max:
+            if idx >= max_clusters:
                 break
             if len(cluster) == 0:
                 continue
@@ -188,32 +189,69 @@ class RLClusteringEnv(gym.Env):
         """
         Compute the reward based on the current cluster configuration.
         """
-        tightness = 0
-        variance = 0
-        num_valid_clusters = 0
+        tightness = 0  # Accumulated tightness value
+        variance = 0   # Variance of cluster sizes
+        num_valid_clusters = 0  # Number of valid clusters
 
         for cluster in self.current_clusters:
-            if len(cluster) == 0:
-                continue
-            num_valid_clusters += 1
-            cluster_boxes = self.detections[cluster]
-            # Compute tightness (mean distance to centroid)
-            centroid = np.mean(cluster_boxes[:, :2], axis=0)
-            distances = np.linalg.norm(cluster_boxes[:, :2] - centroid, axis=1)
-            tightness -= np.mean(distances)
-            # Compute size variance
-            sizes = cluster_boxes[:, 2] * cluster_boxes[:, 3]
-            variance += np.var(sizes)
+            if len(cluster) > 0:
+                num_valid_clusters += 1
+                # Get the detection boxes within the cluster
+                cluster_boxes = self.detections[cluster]
+                # Calculate the area of each detection box (w * h)
+                areas = cluster_boxes[:, 2] * cluster_boxes[:, 3]
+                sum_areas = np.sum(areas)
 
-        # Reward computation
+                # Calculate the minimal bounding rectangle that contains all detection boxes
+                x_centers = cluster_boxes[:, 0]
+                y_centers = cluster_boxes[:, 1]
+                widths = cluster_boxes[:, 2]
+                heights = cluster_boxes[:, 3]
+
+                x_mins = x_centers - widths / 2
+                x_maxs = x_centers + widths / 2
+                y_mins = y_centers - heights / 2
+                y_maxs = y_centers + heights / 2
+
+                x_min = np.min(x_mins)
+                x_max = np.max(x_maxs)
+                y_min = np.min(y_mins)
+                y_max = np.max(y_maxs)
+
+                bounding_box_area = (x_max - x_min) * (y_max - y_min)
+
+                # Compute tightness: sum of detection box areas divided by the area of the bounding rectangle
+                if bounding_box_area > 0:
+                    cluster_tightness = sum_areas / bounding_box_area
+                else:
+                    cluster_tightness = 0  # Avoid division by zero
+
+                tightness += cluster_tightness
+
+                # Compute cluster size (number of samples)
+                cluster_size = len(cluster_boxes)
+                variance += cluster_size
+
+        if num_valid_clusters > 0:
+            # Compute average tightness
+            tightness /= num_valid_clusters
+            # Compute variance of cluster sizes
+            sizes = [len(cluster) for cluster in self.current_clusters if len(cluster) > 0]
+            variance = np.var(sizes)
+        else:
+            tightness = 0
+            variance = 0
+
+        # Reward calculation (since higher tightness is better, we aim to maximize tightness)
         reward = self.alpha * tightness - self.gamma * variance
 
-        # Cluster count penalty
+        # Penalty for cluster count
         num_clusters = num_valid_clusters
         if num_clusters < self.num_clusters_min:
             reward -= self.beta * (self.num_clusters_min - num_clusters)
         elif num_clusters > self.num_clusters_max:
             reward -= self.beta * (num_clusters - self.num_clusters_max)
+
         return reward
 
     def reset(self, seed=None):
@@ -383,7 +421,7 @@ def test_agent(env, model):
     return final_clusters
 
 def process_image_with_rl(image_path, annotation_path, output_path, model, class_filter=0,
-                          bandwidth=None, num_clusters_min=8, num_clusters_max=15):
+                          bandwidth=None, num_clusters_min=5, num_clusters_max=20):
     """
     Process a single image and its annotation, perform clustering, and save the result image.
     Uses MeanShift for initial clustering and then adjusts clusters using the trained RL agent.
@@ -443,10 +481,10 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         initial_labels=initial_labels,
         num_clusters_min=num_clusters_min,
         num_clusters_max=num_clusters_max,
-        alpha=1.0,
-        beta=1.0,
-        gamma=1.0,
-        max_steps_per_episode=50
+        alpha=0.5,
+        beta=5.0,
+        gamma=2.0,
+        max_steps_per_episode=100
     )
 
     # Use the trained RL model to adjust clusters
@@ -513,8 +551,8 @@ def main_rl_training():
     """
     setup_logging()
     # Define directory paths
-    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')
+    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/train')
+    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/train_x_1280/labels')
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -553,12 +591,12 @@ def main_rl_training():
                          image=image,
                          detections=detections,
                          initial_labels=initial_labels,
-                         num_clusters_min=8,
-                         num_clusters_max=15,
-                         alpha=1.0,
-                         beta=1.0,
-                         gamma=1.0,
-                         max_steps_per_episode=50)
+                         num_clusters_min=5,
+                         num_clusters_max=20,
+                         alpha=0.5,
+                         beta=5.0,
+                         gamma=2.0,
+                         max_steps_per_episode=100)
         env_fns.append(env_fn)
 
     logging.info(f"Created {len(env_fns)} RL clustering environment functions.")
@@ -596,7 +634,7 @@ def main_rl_training():
     logging.info(f"Total training timesteps (all environments): {total_timesteps}")
     render_callback = RenderCallback(render_freq=15)
     # Train the RL agent
-    model.learn(total_timesteps=total_timesteps, callback=render_callback)
+    model.learn(total_timesteps=total_timesteps, callback=None)
 
     # Save the model
     model.save("checkpoints/ppo_rl_clustering")
@@ -644,8 +682,8 @@ def main():
             output_path=output_path,
             model=model,
             class_filter=0,
-            num_clusters_min=3,
-            num_clusters_max=15
+            num_clusters_min=5,
+            num_clusters_max=20
         )
 
 if __name__ == "__main__":
