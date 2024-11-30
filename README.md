@@ -6,8 +6,8 @@
 git clone https://github.com/ssjjrrr/Edge-Synergy.git
 cd Edge-Synergy
 
-# dependency
-pip install requirements.txt
+# install dependency. In addition you need to download the appropriate version of Pytorch.
+pip install -r requirements.txt
 
 # initialize submodules 'ultralytics'
 git submodule update --init --recursive
