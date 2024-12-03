@@ -59,9 +59,10 @@ class RLClusteringEnv(gym.Env):
     metadata = {'render.modes': ['save_image', 'rgb_array']}
 
     def __init__(self, image, detections, initial_labels,
-                 num_clusters_min=5, num_clusters_max=20,
-                 alpha=1.0, beta=5.0, gamma=1.0,
-                 max_steps_per_episode=100):
+                 num_clusters_min=8, num_clusters_max=15,
+                 alpha=1.0, beta=25.0, gamma=0.5, delta=100.0,
+                 max_steps_per_episode=30,
+                 y_transform_alpha=0.5):
         super(RLClusteringEnv, self).__init__()
         self.image = image
         self.detections = detections  # Normalized detections [x_center, y_center, w, h]
@@ -71,7 +72,9 @@ class RLClusteringEnv(gym.Env):
         self.alpha = alpha  # Tightness weight
         self.beta = beta    # Cluster count penalty weight
         self.gamma = gamma  # Size variance penalty weight
+        self.delta = delta  # Close cluster center penalty weight
         self.max_steps_per_episode = max_steps_per_episode
+        self.y_transform_alpha = y_transform_alpha
 
         # Initialize clusters
         self.current_clusters = self._initial_clusters()
@@ -190,69 +193,83 @@ class RLClusteringEnv(gym.Env):
         Compute the reward based on the current cluster configuration.
         """
         tightness = 0  # Accumulated tightness value
-        variance = 0   # Variance of cluster sizes
+        detection_size_variance = 0  # Variance of detection box areas within clusters
+        size_variance = 0  # Variance of cluster lengths
         num_valid_clusters = 0  # Number of valid clusters
+        cluster_centroids = []  # List to store centroids of clusters
+        cluster_number_penalty = 0 # Penalty for cluster count outside the specified range
 
         for cluster in self.current_clusters:
             if len(cluster) > 0:
                 num_valid_clusters += 1
                 # Get the detection boxes within the cluster
                 cluster_boxes = self.detections[cluster]
+                
+                # Calculate the centroid of the cluster
+                centroid = np.mean(cluster_boxes[:, :2], axis=0)
+                cluster_centroids.append(centroid)  # Store centroid for later
+                
+                # Calculate the Euclidean distances from each detection box center to the centroid
+                distances = np.linalg.norm(cluster_boxes[:, :2] - centroid, axis=1)
+                average_distance = np.mean(distances)
+                
+                # Accumulate tightness
+                tightness += average_distance
+                
                 # Calculate the area of each detection box (w * h)
                 areas = cluster_boxes[:, 2] * cluster_boxes[:, 3]
-                sum_areas = np.sum(areas)
-
-                # Calculate the minimal bounding rectangle that contains all detection boxes
-                x_centers = cluster_boxes[:, 0]
-                y_centers = cluster_boxes[:, 1]
-                widths = cluster_boxes[:, 2]
-                heights = cluster_boxes[:, 3]
-
-                x_mins = x_centers - widths / 2
-                x_maxs = x_centers + widths / 2
-                y_mins = y_centers - heights / 2
-                y_maxs = y_centers + heights / 2
-
-                x_min = np.min(x_mins)
-                x_max = np.max(x_maxs)
-                y_min = np.min(y_mins)
-                y_max = np.max(y_maxs)
-
-                bounding_box_area = (x_max - x_min) * (y_max - y_min)
-
-                # Compute tightness: sum of detection box areas divided by the area of the bounding rectangle
-                if bounding_box_area > 0:
-                    cluster_tightness = sum_areas / bounding_box_area
-                else:
-                    cluster_tightness = 0  # Avoid division by zero
-
-                tightness += cluster_tightness
-
-                # Compute cluster size (number of samples)
-                cluster_size = len(cluster_boxes)
-                variance += cluster_size
+                
+                # Compute variance of detection box areas
+                area_variance = np.var(areas)  # Variance of areas within the cluster
+                detection_size_variance += area_variance
 
         if num_valid_clusters > 0:
-            # Compute average tightness
+            # Compute average tightness across all valid clusters
             tightness /= num_valid_clusters
+            
+            # Compute average detection box size variance across all valid clusters
+            detection_size_variance /= num_valid_clusters
+
             # Compute variance of cluster sizes
             sizes = [len(cluster) for cluster in self.current_clusters if len(cluster) > 0]
-            variance = np.var(sizes)
+            size_variance = np.var(sizes)
         else:
             tightness = 0
-            variance = 0
+            detection_size_variance = 0
+            size_variance = 0
 
-        # Reward calculation (since higher tightness is better, we aim to maximize tightness)
-        reward = self.alpha * tightness - self.gamma * variance
+        # Compute penalty for close cluster centers
+        close_centers_penalty = 0
+        cluster_centroids = np.array(cluster_centroids)
+        if len(cluster_centroids) > 1:
+            # Compute pairwise distances between cluster centers
+            distances = cdist(cluster_centroids, cluster_centroids)
+            # Set self-distances to a high value to ignore them
+            np.fill_diagonal(distances, np.inf)
+            # Define a threshold distance below which clusters are considered too close
+            threshold_distance = 0.03
+            # Find pairs where distance is less than threshold
+            num_close_pairs = np.sum(distances < threshold_distance) / 2 # Divide by 2 to account for symmetry
+            # Apply penalty proportional to the number of close pairs
+            close_centers_penalty = self.delta * num_close_pairs
+            
 
-        # Penalty for cluster count
+        # Reward calculation
+        # Higher tightness is better, lower detection size variance is better
+        reward = - (self.alpha * tightness) - (self.gamma * (detection_size_variance)) - close_centers_penalty
+        
+        # Penalty for cluster count outside the specified range
         num_clusters = num_valid_clusters
-        if num_clusters < self.num_clusters_min:
-            reward -= self.beta * (self.num_clusters_min - num_clusters)
-        elif num_clusters > self.num_clusters_max:
-            reward -= self.beta * (num_clusters - self.num_clusters_max)
 
+        if num_clusters < self.num_clusters_min:
+            cluster_number_penalty = self.beta * (self.num_clusters_min - num_clusters)
+            reward -= cluster_number_penalty
+        elif num_clusters > self.num_clusters_max:
+            cluster_number_penalty = self.beta * (num_clusters - self.num_clusters_max)
+            reward -= self.beta * cluster_number_penalty
+        logging.info(f"Reward: {reward:.4f} (Tightness: {self.alpha * tightness:.4f}, Cluster Number Penalty: {cluster_number_penalty:.4f}, Detection Size Variance: {self.gamma * detection_size_variance:.4f}, Size Variance: {size_variance:.2f}, Close Centers Penalty: {close_centers_penalty:.4f})")
         return reward
+
 
     def reset(self, seed=None):
         """
@@ -330,13 +347,29 @@ class RLClusteringEnv(gym.Env):
 
     def _split_cluster(self, c):
         if c < len(self.current_clusters) and len(self.current_clusters[c]) > 1:
-            # Use KMeans to split the cluster into two sub-clusters
             cluster = self.current_clusters[c]
             cluster_boxes = self.detections[cluster]
             try:
-                # Explicitly set n_init to suppress the warning
-                kmeans = KMeans(n_clusters=2, n_init=10, random_state=0).fit(cluster_boxes)
+                # Get cluster centroid
+                coords = cluster_boxes[:, :2]
+                x_coords = coords[:, 0]
+                y_coords = coords[:, 1]
+                
+                # compute variance in X and Y directions
+                x_variance = np.var(x_coords)
+                y_variance = np.var(y_coords)
+                
+                # Determine the split direction based on variance
+                if x_variance >= y_variance:
+                    split_dimension = 0  # X
+                else:
+                    split_dimension = 1  # Y
+                split_coords = coords[:, split_dimension].reshape(-1, 1)
+                
+                # Perform KMeans clustering to split the cluster on the selected dimension
+                kmeans = KMeans(n_clusters=2, n_init='auto', random_state=0).fit(split_coords)
                 labels = kmeans.labels_
+
                 cluster1 = [cluster[i] for i in range(len(cluster)) if labels[i] == 0]
                 cluster2 = [cluster[i] for i in range(len(cluster)) if labels[i] == 1]
                 self.current_clusters[c] = cluster1
@@ -344,9 +377,7 @@ class RLClusteringEnv(gym.Env):
             except Exception as e:
                 logging.error(f"KMeans split failed: {e}")
         else:
-            # Cannot split clusters with only one element
             pass
-
 
     def render(self, mode='save_image'):
         """
@@ -421,7 +452,7 @@ def test_agent(env, model):
     return final_clusters
 
 def process_image_with_rl(image_path, annotation_path, output_path, model, class_filter=0,
-                          bandwidth=None, num_clusters_min=5, num_clusters_max=20):
+                          bandwidth=None, num_clusters_min=10, num_clusters_max=15):
     """
     Process a single image and its annotation, perform clustering, and save the result image.
     Uses MeanShift for initial clustering and then adjusts clusters using the trained RL agent.
@@ -481,10 +512,12 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         initial_labels=initial_labels,
         num_clusters_min=num_clusters_min,
         num_clusters_max=num_clusters_max,
-        alpha=0.5,
-        beta=5.0,
-        gamma=2.0,
-        max_steps_per_episode=100
+        alpha=50.0,
+        beta=1,
+        gamma=1000000,
+        delta=5.0,
+        max_steps_per_episode=30,
+        y_transform_alpha=0.5
     )
 
     # Use the trained RL model to adjust clusters
@@ -551,8 +584,8 @@ def main_rl_training():
     """
     setup_logging()
     # Define directory paths
-    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/train')
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/train_x_1280/labels')
+    images_dir = Path('data/PANDA/images/train_all')
+    annotations_dir = Path('runs/detect/train_all/labels')
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -591,12 +624,14 @@ def main_rl_training():
                          image=image,
                          detections=detections,
                          initial_labels=initial_labels,
-                         num_clusters_min=5,
-                         num_clusters_max=20,
-                         alpha=0.5,
-                         beta=5.0,
-                         gamma=2.0,
-                         max_steps_per_episode=100)
+                         num_clusters_min=10,
+                         num_clusters_max=15,
+                         alpha=50.0,
+                         beta=1.0,
+                         gamma=1000000.0,
+                         delta=5.0,
+                         max_steps_per_episode=30,
+                         y_transform_alpha=0.5)
         env_fns.append(env_fn)
 
     logging.info(f"Created {len(env_fns)} RL clustering environment functions.")
@@ -625,10 +660,10 @@ def main_rl_training():
     )
 
     # Initialize PPO model
-    model = PPO("MlpPolicy", vec_env, verbose=1, policy_kwargs=policy_kwargs)
+    model = PPO("MlpPolicy", vec_env, verbose=1, policy_kwargs=policy_kwargs, device='cpu')
 
     # Define total training timesteps
-    steps_per_env = 1000  # Adjust as needed
+    steps_per_env = 3000
     total_timesteps = steps_per_env * n_envs
 
     logging.info(f"Total training timesteps (all environments): {total_timesteps}")
@@ -646,9 +681,9 @@ def main():
     """
     setup_logging()
     # Define directory paths
-    images_dir = Path('/home/edge/work/Edge-Synergy/data/PANDA/images/val')  # Replace with your image folder path
-    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
-    output_dir = Path('/home/edge/work/Edge-Synergy/cluster_output')  # Replace with your desired output folder path
+    images_dir = Path('data/PANDA/images/val')  # Replace with your image folder path
+    annotations_dir = Path('runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
+    output_dir = Path('cluster_output')  # Replace with your desired output folder path
 
     # Supported image extensions
     image_extensions = ['jpg', 'jpeg', 'png']
@@ -682,8 +717,8 @@ def main():
             output_path=output_path,
             model=model,
             class_filter=0,
-            num_clusters_min=5,
-            num_clusters_max=20
+            num_clusters_min=10,
+            num_clusters_max=15
         )
 
 if __name__ == "__main__":
