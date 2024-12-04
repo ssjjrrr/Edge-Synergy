@@ -59,10 +59,10 @@ class RLClusteringEnv(gym.Env):
     metadata = {'render.modes': ['save_image', 'rgb_array']}
 
     def __init__(self, image, detections, initial_labels,
-                 num_clusters_min=8, num_clusters_max=15,
-                 alpha=1.0, beta=25.0, gamma=0.5, delta=100.0,
-                 max_steps_per_episode=30,
-                 y_transform_alpha=0.5):
+                 num_clusters_min, num_clusters_max,
+                 alpha, beta, gamma, delta,
+                 max_steps_per_episode,
+                 y_transform_alpha):
         super(RLClusteringEnv, self).__init__()
         self.image = image
         self.detections = detections  # Normalized detections [x_center, y_center, w, h]
