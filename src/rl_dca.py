@@ -22,14 +22,13 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
     Computes expanded bounding rectangles and records area of each detection box in each cluster.
     Ensures expanded rectangles do not exceed the image boundaries.
     """
-    # 读取图像
+
     image = cv2.imread(str(image_path))
     if image is None:
         logging.error(f"Cannot read image {image_path}")
         return
-    height, width = image.shape[:2]  # 获取实际图像尺寸
+    height, width = image.shape[:2]
 
-    # 读取注释文件
     detections = []
     with open(annotation_path, 'r') as f:
         for line in f:
@@ -44,10 +43,8 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
                     'h': float(h)
                 })
 
-    # 按类别过滤检测框
     class_detections = [det for det in detections if det['class'] == class_filter]
 
-    # 获取位置和尺寸（归一化）
     positions_sizes = []
     for det in class_detections:
         center_x = det['x']
@@ -57,7 +54,6 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         positions_sizes.append([center_x, center_y, w, h])
     positions_sizes = np.array(positions_sizes)
 
-    # 执行 MeanShift 聚类
     if len(positions_sizes) > 0:
         initial_labels = perform_meanshift(positions_sizes, bandwidth=bandwidth, alpha=0.5)
     else:
@@ -175,7 +171,7 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         with open(output_json_path, 'w') as f:
             json.dump(output_data, f, indent=4)
         logging.info(f"Saved cluster data: {output_json_path}")
-        
+
     except Exception as e:
         logging.error(f"Failed to save cluster data {output_json_path}: {e}")
 
