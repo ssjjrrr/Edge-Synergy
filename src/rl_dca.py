@@ -143,10 +143,10 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         x2_cluster = max(x2_list)
         y2_cluster = max(y2_list)
 
-        x1_expanded = x1_cluster - max_width
-        y1_expanded = y1_cluster - max_height
-        x2_expanded = x2_cluster + max_width
-        y2_expanded = y2_cluster + max_height
+        x1_expanded = x1_cluster - 0.1 * max_width
+        y1_expanded = y1_cluster - 0.1 * max_height
+        x2_expanded = x2_cluster + 0.1 * max_width
+        y2_expanded = y2_cluster + 0.1 * max_height
 
         x1_expanded = max(0, x1_expanded)
         y1_expanded = max(0, y1_expanded)
