@@ -2,6 +2,15 @@ import json
 import logging
 import numpy as np
 import cv2
+import sklearn
+from pathlib import Path
+from stable_baselines3 import PPO
+from agent import setup_logging, RLClusteringEnv, perform_meanshift, test_agent
+
+import json
+import logging
+import numpy as np
+import cv2
 from pathlib import Path
 from stable_baselines3 import PPO
 from agent import setup_logging, RLClusteringEnv, perform_meanshift, test_agent
@@ -75,6 +84,7 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
             final_labels[idx] = cluster_id
         cluster_id += 1
 
+    # 将坐标从归一化转换为绝对坐标
     for det in class_detections:
         det['x'] *= width
         det['y'] *= height
@@ -91,12 +101,18 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
             clusters_dict[cluster_label] = {
                 'detection_areas': [],
                 'max_width': 0,
-                'max_height': 0
+                'max_height': 0,
+                'detections_xywh': []
             }
 
         area = det['w'] * det['h']
-
         clusters_dict[cluster_label]['detection_areas'].append(float(area))
+        clusters_dict[cluster_label]['detections_xywh'].append({
+            'x': float(det['x']),
+            'y': float(det['y']),
+            'w': float(det['w']),
+            'h': float(det['h'])
+        })
 
         if det['w'] > clusters_dict[cluster_label]['max_width']:
             clusters_dict[cluster_label]['max_width'] = det['w']
@@ -113,13 +129,13 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         y1_list = []
         x2_list = []
         y2_list = []
-        for det in class_detections:
-            if final_labels[class_detections.index(det)] != cluster_label:
-                continue
-            x = det['x']
-            y = det['y']
-            w = det['w']
-            h = det['h']
+
+        # 使用 clusters_dict 内存储的检测框坐标来计算聚类的包围框
+        for det_item in cluster_info['detections_xywh']:
+            x = det_item['x']
+            y = det_item['y']
+            w = det_item['w']
+            h = det_item['h']
             x1 = x - w / 2
             y1 = y - h / 2
             x2 = x + w / 2
@@ -152,7 +168,8 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
                 'x2': int(x2_expanded),
                 'y2': int(y2_expanded)
             },
-            'detection_areas': detection_areas
+            'detection_areas': detection_areas,
+            'detections_xywh': cluster_info['detections_xywh']
         })
 
     output_json_path = output_path.with_suffix('.json')
@@ -165,6 +182,7 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
 
     except Exception as e:
         logging.error(f"Failed to save cluster data {output_json_path}: {e}")
+
 
 
 def main():
