@@ -83,8 +83,8 @@ def process_nms_for_all_images(results_dir, output_dir, iou_threshold=0.5):
 
 if __name__ == "__main__":
 
-    results_dir = "/home/edge/work/ultralytics/runs/detect/predict27/labels"  # predict results directory
-    output_dir = "/home/edge/work/ultralytics/runs/detect/predict27/label_nms"  # NMS results directory
-    iou_threshold = 0.7  # NMS IOU threshold
+    results_dir = "/home/edge/work/Edge-Synergy/runs/detect/coarse_detection/label_merged_results"  # predict results directory
+    output_dir = "/home/edge/work/Edge-Synergy/runs/detect/coarse_detection/label_merged_results_nms"  # NMS results directory
+    iou_threshold = 0.5  # NMS IOU threshold
     
     process_nms_for_all_images(results_dir, output_dir, iou_threshold)

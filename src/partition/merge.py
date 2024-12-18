@@ -1,30 +1,32 @@
 import os
 import numpy as np
 
-
+# Updated slice configuration for 3x3 grid
 image_width = 3840
 image_height = 2160
-slice_row = 2
-slice_col = 2
+slice_row = 3
+slice_col = 3
 base_height = image_height // slice_row
 base_width = image_width // slice_col
-overlap = 100
-iou_threshold = 0.7
+overlap = 400
+iou_threshold = 0.3
 
-def convert_coordinates(slice_index, x, y, w, h, base_width, base_height, overlap, image_width, image_height):
-    row = slice_index // slice_row
-    col = slice_index % slice_row
+def convert_coordinates(slice_index, x, y, w, h, base_width, base_height, overlap, image_width, image_height, slice_row, slice_col):
+    row = slice_index // slice_col  # Corrected to use slice_col for row calculation
+    col = slice_index % slice_col
+
     x_offset = col * base_width
     y_offset = row * base_height
-    
-    slice_width = base_width + (overlap if col < 1 else 0)
-    slice_height = base_height + (overlap if row < 1 else 0)
-    
+
+    # Adjust overlap based on position in the grid
+    slice_width = base_width + (overlap if col < slice_col - 1 else 0)
+    slice_height = base_height + (overlap if row < slice_row - 1 else 0)
+
     abs_x_center = (x * slice_width + x_offset) / image_width
     abs_y_center = (y * slice_height + y_offset) / image_height
     abs_w = w * slice_width / image_width
     abs_h = h * slice_height / image_height
-    
+
     return abs_x_center, abs_y_center, abs_w, abs_h
 
 def load_yolo_results(file_path):
@@ -95,37 +97,55 @@ def apply_nms(results, iou_threshold=0.5):
 
     return nms_results
 
-def merge_yolo_results_for_image(image_name, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, iou_threshold):
+def merge_yolo_results_for_image(image_name, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, slice_row, slice_col, iou_threshold):
     output_file = os.path.join(output_dir, f"{image_name}.txt")
     all_results = []
-    for slice_index in range(4):
+    total_slices = slice_row * slice_col
+
+    for slice_index in range(total_slices):
         slice_file = os.path.join(slice_dir, f"{image_name}_{slice_index + 1}.txt")
         if not os.path.exists(slice_file):
             continue
         with open(slice_file, 'r') as infile:
             for line in infile:
                 parts = line.strip().split()
-                class_id = parts[0]
+                class_id = int(parts[0])
                 x, y, w, h, score = map(float, parts[1:])
-                abs_x, abs_y, abs_w, abs_h = convert_coordinates(slice_index, x, y, w, h, base_width, base_height, overlap, image_width, image_height)
+                abs_x, abs_y, abs_w, abs_h = convert_coordinates(
+                    slice_index, x, y, w, h, base_width, base_height, overlap, image_width, image_height, slice_row, slice_col
+                )
                 all_results.append((class_id, abs_x, abs_y, abs_w, abs_h, score))
-    
+    # Apply Non-Maximum Suppression
     nms_results = apply_nms(all_results, iou_threshold)
+    # Save the merged results
     save_yolo_results(output_file, nms_results)
 
-def process_all_images(image_dir, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, iou_threshold=0.5):
+def process_all_images(image_dir, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, slice_row, slice_col, iou_threshold=0.5):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
     for image_file in os.listdir(image_dir):
-        if image_file.endswith(".jpg"):
+        if image_file.lower().endswith((".jpg", ".jpeg", ".png")):
             image_name, _ = os.path.splitext(image_file)
-            merge_yolo_results_for_image(image_name, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, iou_threshold)
+            merge_yolo_results_for_image(
+                image_name, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, slice_row, slice_col, iou_threshold
+            )
 
 if __name__ == "__main__":
+    image_dir = "data/PANDA/images/val"
+    slice_dir = "runs/detect/3x3_v8l/labels"
+    output_dir = slice_dir.rstrip('s') + "_merged_results"  # Adjusted to correctly replace 'labels' with 'label_merged_results'
 
-    image_dir = "/home/edge/work/datasets/PANDA_dataset/images/val"
-    slice_dir = "/home/edge/work/ultralytics/runs/detect/predict26/labels"
-    output_dir = slice_dir[:-1] + "_merged_results"
-    
-    process_all_images(image_dir, slice_dir, output_dir, base_width, base_height, overlap, image_width, image_height, iou_threshold)
+    process_all_images(
+        image_dir,
+        slice_dir,
+        output_dir,
+        base_width,
+        base_height,
+        overlap,
+        image_width,
+        image_height,
+        slice_row,
+        slice_col,
+        iou_threshold
+    )

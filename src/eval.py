@@ -2,7 +2,7 @@ import os
 import glob
 import numpy as np
 import cv2
-from config import *
+# from config import *
 
 
 def load_yolo_annotations(annotation_dir, image_dir):
@@ -104,7 +104,7 @@ def compute_AP(matched_table, iou_threshold, sum_groundtruths):
     detection_count = np.arange(1, num_detections + 1)
     precision = TP_count / detection_count
     recall = TP_count / sum_groundtruths
-    
+    #breakpoint()
     mrec = np.concatenate(([0.], recall, [min(recall[-1] + 1E-3, 1.)]))
     mpre = np.concatenate(([0.], precision, [0.]))
     mpre = np.flip(np.maximum.accumulate(np.flip(mpre)))
@@ -124,9 +124,9 @@ def compute_mAP(groundtruths, detections, classes, maxDets=1000):
     return APs
 
 if __name__ == "__main__":
-    classes = ["person", "fakeperson"]
-    annotations = load_yolo_annotations(annotation_dir=os.path.join(label_dir, 'val'), image_dir=os.path.join(image_dir, 'val'))
-    results = load_yolo_results(result_dir, image_dir=os.path.join(image_dir, 'val'))
+    classes = ["person"]
+    annotations = load_yolo_annotations(annotation_dir="/home/edge/work/Edge-Synergy/data/PANDA/labels/scene/6", image_dir="/home/edge/work/Edge-Synergy/data/PANDA/images/scene/6")
+    results = load_yolo_results("/home/edge/work/Edge-Synergy/runs/detect/repose_results", image_dir="/home/edge/work/Edge-Synergy/data/PANDA/images/scene/6")
     mAP = compute_mAP(annotations, results, classes)
     
     print(f"MAP50:95 of person:{mAP[0][0]}, MAP50 of person:{mAP[0][1]}")

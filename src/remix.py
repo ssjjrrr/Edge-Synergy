@@ -45,11 +45,6 @@ ap_vectors = {
         '0-8':0.0,'8-16':0.00740,'16-24':0.0660,'24-32':0.142,'32-48':0.284,
         '48-64':0.393,'64-80':0.404,'80-96':0.422,'96-128':0.507,'128-160':0.564,
         '160-196':0.590,'196-':0.699
-    },
-    'YOLOv8x': {
-        '0-8':0.0,'8-16':0.0296,'16-24':0.111,'24-32':0.199,'32-48':0.343,
-        '48-64':0.431,'64-80':0.424,'80-96':0.452,'96-128':0.536,'128-160':0.608,
-        '160-196':0.665,'196-':0.690
     }
 }
 
@@ -76,18 +71,12 @@ networks = [
     {
         'name': 'YOLOv8l',
         'input_size': (1024, 1024),
-        'latency': 234.8, # ms
+        'latency': 153.8, # ms
         'ap_vector': ap_vectors['YOLOv8l']
-    },
-    {
-        'name': 'YOLOv8x',
-        'input_size': (1280, 1280),
-        'latency': 318.2, # ms
-        'ap_vector': ap_vectors['YOLOv8x']
     }
 ]
 
-MAX_DEPTH = 3  # maximum depth for recursive partitioning
+MAX_DEPTH = 2  # maximum depth for recursive partitioning
 
 def compute_F_p(block_coords, objects, size_categories, network_input_size):
     """
@@ -256,7 +245,7 @@ if __name__ == '__main__':
     # 定义图像和GT文件的目录
     image_dir = '/home/edge/work/Edge-Synergy/data/PANDA/images/train_all'       # 请替换为您的图像文件夹路径
     gt_boxes_dir = '/home/edge/work/Edge-Synergy/data/PANDA/labels/train_all'  # 请替换为您的GT文件夹路径
-    scene = 'IMG_01_01'
+    scene = 'IMG_02_01'
     # breakpoint()
     scene_object_info = {}
     image_path = os.path.join(image_dir, f'{scene}.jpg')
@@ -343,13 +332,10 @@ if __name__ == '__main__':
 
     # 调用划分计划生成函数
     best_plans = generate_partition_plans(V, objects, networks, T, size_categories, 0, MAX_DEPTH)
-    breakpoint()
+    # breakpoint()
     if best_plans:
-        best_plan = best_plans[0]
-        print(f"环境 {scene} 的最佳划分计划:")
-        print(f"使用网络: {best_plan['network_assignments']}")
-        print(f"估计检测精度: {best_plan['eap']:.4f}")
-        print(f"估计延迟: {best_plan['latency']:.2f} ms")
+        best_plan = best_plans[-1]
+        print(f"最佳划分计划：{best_plan}")
     else:
         print(f"环境 {scene} 没有符合延迟预算的划分计划。")
 

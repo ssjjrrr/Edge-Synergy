@@ -1,8 +1,10 @@
 __pycache__/
 PANDA/
 runs/
-cluster_output/
+*output/
 agent_render/
+ms*/
 *.log
 *.zip
 *.pt
+

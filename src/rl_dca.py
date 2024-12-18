@@ -2,15 +2,8 @@ import json
 import logging
 import numpy as np
 import cv2
+import time
 import sklearn
-from pathlib import Path
-from stable_baselines3 import PPO
-from agent import setup_logging, RLClusteringEnv, perform_meanshift, test_agent
-
-import json
-import logging
-import numpy as np
-import cv2
 from pathlib import Path
 from stable_baselines3 import PPO
 from agent import setup_logging, RLClusteringEnv, perform_meanshift, test_agent
@@ -182,7 +175,40 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
 
     except Exception as e:
         logging.error(f"Failed to save cluster data {output_json_path}: {e}")
+    colors = []
+    np.random.seed(42)
+    unique_final_labels = np.unique(final_labels)
+    unique_final_labels = unique_final_labels[unique_final_labels != -1]
+    num_final_clusters = len(unique_final_labels)
+    for _ in unique_final_labels:
+        color = [int(c) for c in np.random.randint(0, 255, 3)]
+        colors.append(color)
+    for idx, det in enumerate(class_detections):
+        center_x, center_y = det['x'], det['y']
+        w, h = det['w'], det['h']
+        x1 = int(center_x - w / 2)
+        y1 = int(center_y - h / 2)
+        x2 = int(center_x + w / 2)
+        y2 = int(center_y + h / 2)
 
+        if len(final_labels) > idx and final_labels[idx] != -1:
+            cluster_label = final_labels[idx]
+            color = colors[cluster_label % len(colors)]
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(image, f'Cluster {cluster_label}', (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        else:
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(image, 'No Cluster', (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    try:
+        # Ensure output directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output_path), image)
+        logging.info(f"Saved: {output_path}")
+    except Exception as e:
+        logging.error(f"Failed to save image {output_path}: {e}")
 
 
 def main():
@@ -192,7 +218,7 @@ def main():
     setup_logging()
     # Define directory paths
     images_dir = Path('data/PANDA/images/val')  # Replace with your image folder path
-    annotations_dir = Path('runs/detect/val_x_1280/labels')  # Replace with your annotation folder path
+    annotations_dir = Path('/home/edge/work/Edge-Synergy/runs/detect/coarse_detection_2x2/label_merged_results')  # Replace with your annotation folder path
     output_dir = Path('cluster_output')  # Replace with your desired output folder path
 
     # Supported image extensions
@@ -221,6 +247,7 @@ def main():
             continue
 
         output_path = output_dir / image_path.name
+        start_time = time.time()
         process_image_with_rl(
             image_path=image_path,
             annotation_path=annotation_path,
@@ -230,6 +257,8 @@ def main():
             num_clusters_min=10,
             num_clusters_max=15
         )
+        process_time = (time.time() - start_time) / 78
+        print(f"process latency: {process_time}")
 
 if __name__ == "__main__":
     main()

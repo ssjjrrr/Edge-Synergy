@@ -2,8 +2,8 @@ import cv2
 import os
 
 
-slice_row = 2
-slice_col = 2
+slice_row = 3
+slice_col = 3
 
 def slice_image(image_path, output_dir, overlap=100):
 
@@ -37,7 +37,7 @@ def slice_images_in_dir(input_dir, output_dir, overlap=100):
             slice_image(image_path, output_dir, overlap)
 
 if __name__ == "__main__":
-    image_path = "/home/edge/work/datasets/PANDA_dataset/images/val"
-    output_dir = "/home/edge/work/datasets/PANDA_dataset/images/sliced_val"
+    image_path = "data/PANDA/images/val"
+    output_dir = "data/PANDA/images/sliced_val_3x3"
 
-    slice_images_in_dir(image_path, output_dir)
+    slice_images_in_dir(image_path, output_dir, 400)

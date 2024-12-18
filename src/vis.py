@@ -18,6 +18,7 @@ def load_yolo_results(file_path):
     return results
 
 def draw_boxes(image, results, color=(0, 255, 0)):
+    
     for result in results:
         class_id, x_center, y_center, width, height, score = result
         x1 = int((x_center - width / 2) * image.shape[1])
@@ -47,6 +48,7 @@ def visualize_results(image_dir, results_dir, output_dir):
                 cv2.imwrite(output_image_path, image_with_boxes)
 
 if __name__ == "__main__":
-    output_dir = result_dir + "_vis"  # visualized results output directory
     
+    result_dir = "/home/edge/work/Edge-Synergy/runs/detect/coarse_detection_2x2/label_merged_results"
+    output_dir = result_dir + "_vis_white"  # visualized results output directory
     visualize_results(os.path.join(image_dir, "val"), result_dir, output_dir)
