@@ -1,12 +1,14 @@
-import json
+﻿import json
 import logging
+import pathlib
+import os
 import numpy as np
 import cv2
-import time
 import sklearn
 from pathlib import Path
 from stable_baselines3 import PPO
 from agent import setup_logging, RLClusteringEnv, perform_meanshift, test_agent
+
 
 def process_image_with_rl(image_path, annotation_path, output_path, model, class_filter=0,
                           bandwidth=None, num_clusters_min=10, num_clusters_max=15):
@@ -23,18 +25,38 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
     height, width = image.shape[:2]
 
     detections = []
-    with open(annotation_path, 'r') as f:
-        for line in f:
-            parts = line.strip().split(' ')
-            if len(parts) >= 5:
-                cls, x, y, w, h = parts[:5]
-                detections.append({
-                    'class': int(cls),
-                    'x': float(x),
-                    'y': float(y),
-                    'w': float(w),
-                    'h': float(h)
-                })
+    suffix = pathlib.Path(annotation_path).suffix.lower()
+
+    if suffix == '.json':
+        with open(annotation_path, 'r') as f:
+            data = json.load(f)
+            if isinstance(data, dict) and 'detections' in data:
+                det_iter = data['detections']
+            else:
+                det_iter = [d for cl in data for d in cl.get('detections_xywh', [])]
+
+            for det in det_iter:
+                cls = det.get('class_id', 0)
+                x1, y1, x2, y2 = det['bbox']
+                cx = (x1 + x2) / 2 / width
+                cy = (y1 + y2) / 2 / height
+                w = (x2 - x1) / width
+                h = (y2 - y1) / height
+                detections.append({'class': cls, 'x': cx, 'y': cy, 'w': w, 'h': h})
+
+    else:
+        with open(annotation_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(' ')
+                if len(parts) >= 5:
+                    cls, x, y, w, h = parts[:5]
+                    detections.append({
+                        'class': int(cls),
+                        'x': float(x),
+                        'y': float(y),
+                        'w': float(w),
+                        'h': float(h)
+                    })
 
     class_detections = [det for det in detections if det['class'] == class_filter]
 
@@ -77,7 +99,6 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
             final_labels[idx] = cluster_id
         cluster_id += 1
 
-    # 将坐标从归一化转换为绝对坐标
     for det in class_detections:
         det['x'] *= width
         det['y'] *= height
@@ -123,7 +144,6 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
         x2_list = []
         y2_list = []
 
-        # 使用 clusters_dict 内存储的检测框坐标来计算聚类的包围框
         for det_item in cluster_info['detections_xywh']:
             x = det_item['x']
             y = det_item['y']
@@ -165,7 +185,7 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
             'detections_xywh': cluster_info['detections_xywh']
         })
 
-    output_json_path = output_path.with_suffix('.json')
+    output_json_path = pathlib.Path(os.path.splitext(output_path)[0] + ".json")
 
     try:
         output_json_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +230,88 @@ def process_image_with_rl(image_path, annotation_path, output_path, model, class
     except Exception as e:
         logging.error(f"Failed to save image {output_path}: {e}")
 
+def cluster_from_mem(
+        image: "np.ndarray",
+        detections_dict: dict,
+        model=None,
+        class_filter: int = 0,
+        num_clusters_min: int = 0,
+        num_clusters_max: int = 5
+):
+    """
+    Args
+    ----
+    image            : BGR ndarray (original image)
+    detections_dict  : {'width':W,'height':H,'detections':[{'bbox':[x1,y1,x2,y2],'class_id':..},...]}
+    model            : loaded PPO model or None
+    Returns
+    -------
+    clusters         : list[dict] in the same schema as legacy cluster.json
+    """
+    import numpy as np
 
+    H, W = image.shape[:2]
+
+    class_dets = []
+    for d in detections_dict.get("detections", []):
+        if d.get("class_id", 0) != class_filter:
+            continue
+        x1, y1, x2, y2 = d["bbox"]
+        cx, cy = (x1 + x2) / 2 / W, (y1 + y2) / 2 / H
+        w, h   = (x2 - x1) / W, (y2 - y1) / H
+        class_dets.append([cx, cy, w, h])
+    det_arr = np.asarray(class_dets, dtype=np.float32)
+    if det_arr.size:
+        init_labels = perform_meanshift(det_arr, bandwidth=None, alpha=0.5)
+    else:
+        init_labels = np.array([])
+
+    from agent import RLClusteringEnv, test_agent
+    env = RLClusteringEnv(
+        image=image,
+        detections=det_arr,
+        initial_labels=init_labels,
+        num_clusters_min=num_clusters_min,
+        num_clusters_max=num_clusters_max,
+        alpha=50.0, beta=1, gamma=1e6, delta=5.0,
+        max_steps_per_episode=30, y_transform_alpha=0.5
+    )
+    final_clusters = test_agent(env, model)
+
+    clusters_out = []
+    label_map = np.full(len(det_arr), -1, int)
+
+    for cid, cl in enumerate(final_clusters):
+        valid_inds = [idx for idx in cl if 0 <= idx < len(det_arr)]
+        for idx in valid_inds:
+            label_map[idx] = cid
+
+
+    for cid in range(label_map.max() + 1):
+        inds = np.where(label_map == cid)[0]
+        if inds.size == 0:
+            continue
+        xs = (det_arr[inds, 0] * W)
+        ys = (det_arr[inds, 1] * H)
+        ws = (det_arr[inds, 2] * W)
+        hs = (det_arr[inds, 3] * H)
+        x1s = xs - ws / 2; y1s = ys - hs / 2
+        x2s = xs + ws / 2; y2s = ys + hs / 2
+        bb = [int(max(0,  x1s.min())),
+              int(max(0,  y1s.min())),
+              int(min(W, x2s.max())),
+              int(min(H, y2s.max()))]
+
+        clusters_out.append({
+            "cluster_id": int(cid),
+            "bounding_box": {"x1":bb[0],"y1":bb[1],"x2":bb[2],"y2":bb[3]},
+            "detection_areas": (ws*hs).tolist(),
+            "detections_xywh": [
+                {"x": float(x), "y": float(y), "w": float(w), "h": float(h)}
+                for x, y, w, h in zip(xs, ys, ws, hs)
+            ]
+        })
+    return clusters_out
 def main():
     """
     Main function to process images and apply the trained RL agent.
@@ -247,7 +348,6 @@ def main():
             continue
 
         output_path = output_dir / image_path.name
-        start_time = time.time()
         process_image_with_rl(
             image_path=image_path,
             annotation_path=annotation_path,
@@ -257,8 +357,7 @@ def main():
             num_clusters_min=10,
             num_clusters_max=15
         )
-        process_time = (time.time() - start_time) / 78
-        print(f"process latency: {process_time}")
 
 if __name__ == "__main__":
     main()
+
